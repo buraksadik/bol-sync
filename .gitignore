@@ -1,0 +1,15 @@
+node_modules/
+.env
+.env.*
+!.env.example
+data/
+*.log
+.DS_Store
+
+# Business material. Stays on disk, never published: lead sources, cold-email
+# templates, Fiverr pricing, the 30-day plan, and the demo recording script.
+docs/leads.md
+docs/email-templates.md
+docs/fiverr-gigs.md
+docs/30-gun-plani.md
+docs/demos.md
