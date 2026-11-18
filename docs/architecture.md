@@ -1,84 +1,85 @@
-# Stok / Fiyat Senkron Servisi — Mimari
+# Stock and price sync — architecture
 
-Amaç: bir webshop'un (WooCommerce, Shopify, CSV/XML tedarikçi feed'i veya ERP) stok ve
-fiyat bilgisini Bol.com satıcı hesabına **fazla satış yapmadan** ve **rate limit yemeden**
-aktarmak.
+The job: move stock and price from a webshop (WooCommerce, Shopify, a CSV/XML supplier
+feed, or an ERP) into a Bol.com seller account **without overselling** and **without
+breaking the rate limit**.
 
-Tasarımın tek cümlelik özeti: kaynak sistem gerçeği söyler, kurallar motoru hedefi hesaplar,
-kuyruk tek tek iter, mutabakat sapmayı yakalar.
+The design in one sentence: the source system tells the truth, the rules engine works out
+the target, the queue sends one change at a time, and reconciliation catches whatever
+drifted.
 
 ```
-kaynak (webhook/poll)
+source (webhook / poll)
       │
       ▼
  source_state  ──►  planner (safety stock + price rules)  ──►  offer_state.desired_*
                                                                      │
-                                                              differ │ (eşik + öncelik)
+                                                              differ │ (threshold + priority)
                                                                      ▼
-                                                               sync_jobs (kuyruk)
+                                                               sync_jobs (queue)
                                                                      │
                                                       limiter ──► worker ──► Bol v11 PATCH
                                                                      │
                                                                      ▼
                                                              offer_state.pushed_*
                                                                      ▲
-                       reconciler (15 dk, GET /retailer/offers) ─────┘
+                       reconciler (15 min, GET /retailer/offers) ────┘
 ```
 
 ---
 
-## 1. Neden v11
+## 1. Why v11
 
-v10'da stok ve fiyat iki ayrı `PUT` ve her biri **202** dönüp `processStatusId` veriyor;
-sonucu öğrenmek için ayrıca polling gerekiyor. v11'de tek `PATCH` ile ikisi birden
-güncelleniyor ve **204** ile iş bitmiş oluyor.
+On v10, stock and price are two separate `PUT` calls. Each returns **202** with a
+`processStatusId`, and you have to poll to find out what happened. On v11 a single `PATCH`
+updates both and returns **204**. The work is done when the call returns.
 
-Pratik sonuç: 5.000 ürünlük bir kataloğun tam güncellemesi
+What that means for a full update of a 5,000 product catalogue:
 
-- v10: 10.000 yazma + 10.000 process status sorgusu
-- v11: 5.000 yazma, polling yok
+- v10: 10,000 writes plus 10,000 process-status reads
+- v11: 5,000 writes, no polling
 
-`src/bol/offers.v10.js` yine de duruyor. Müşterinin hesabı v11'e açılmamışsa
-tek satırlık konfigürasyonla (`BOL_OFFERS_API_VERSION=v10`) eski uçlara düşülür.
+`src/bol/offers.v10.js` is still here. If a client's account is not on v11 yet, one line
+of configuration (`BOL_OFFERS_API_VERSION=v10`) falls back to the old endpoints.
 
 ---
 
-## 2. Tablo yapısı
+## 2. Tables
 
-Postgres. Küçük kurulumlar için aynı şema SQLite'ta da çalışır (`uuid` → `text`,
+PostgreSQL. For small installs the same schema runs on SQLite (`uuid` → `text`,
 `jsonb` → `text`, `numeric` → `real`).
 
-| Tablo | Ne tutar | Kritik nokta |
+| Table | What it holds | The point of it |
 |---|---|---|
-| `tenants` | Müşteri + şifrelenmiş Bol kimlik bilgileri | `rate_budget_pct` ile limitin kaçta kaçını kullanacağımız |
-| `products` | sku ↔ ean ↔ `offer_id` eşlemesi | `offer_id` yoksa önce EAN'den çözülür |
-| `source_state` | Kaynağın söylediği ham stok/fiyat | `payload_hash` ile gereksiz iş elenir |
-| `offer_state` | `desired_*`, `pushed_*`, `bol_*` üç katman | Üç katmanın ayrılması mutabakatın temeli |
-| `safety_stock_rules` | Tampon kuralları (tenant veya sku kapsamlı) | `priority` ile en dar kural kazanır |
-| `price_rules` | Taban, tavan, yuvarlama, maksimum değişim | `max_change_pct` fiyat kazası sigortası |
-| `sync_jobs` | Kuyruk | `dedupe_key` ile ürün başına tek bekleyen iş |
-| `sync_log` | Her HTTP çağrısının isteği/cevabı | Müşteriye "ne zaman ne gönderdik" kanıtı |
-| `dead_letters` | Kalıcı hatalar | Sessizce kaybolan ürün olmaz |
-| `rate_buckets` | Token bucket'ın kalıcı hâli | Çok işlemli kurulumda ortak kova |
+| `tenants` | One client, with encrypted Bol credentials | `rate_budget_pct` decides how much of the limit we spend |
+| `products` | sku ↔ ean ↔ `offer_id` | With no `offer_id`, the EAN resolves it first |
+| `source_state` | Raw stock and price from the source | `payload_hash` drops work that changed nothing |
+| `offer_state` | `desired_*`, `pushed_*`, `bol_*` — three layers | Keeping them apart is what makes reconciliation possible |
+| `safety_stock_rules` | Buffer rules, per tenant or per sku | `priority` lets the narrowest rule win |
+| `price_rules` | Floor, ceiling, rounding, maximum change | `max_change_pct` is the insurance against a price accident |
+| `sync_jobs` | The queue | `dedupe_key` keeps one open job per product |
+| `sync_log` | Request and response of every HTTP call | Proof for the client of what we sent and when |
+| `dead_letters` | Permanent failures | No product disappears quietly |
+| `rate_buckets` | The token bucket, persisted | A shared bucket for multi-process installs |
 
-### Neden üç katman stok (`desired` / `pushed` / `bol`)
+### Why three stock layers (`desired` / `pushed` / `bol`)
 
-- `desired_stock` — kuralları uyguladıktan sonra göndermek **istediğimiz** sayı.
-- `pushed_stock` — en son gerçekten **gönderdiğimiz** sayı.
-- `bol_stock` + `bol_corrected_stock` — Bol'un **okuduğumuzda söylediği** sayı.
+- `desired_stock` — the number we **want** to send, after the rules.
+- `pushed_stock` — the number we last actually **sent**.
+- `bol_stock` + `bol_corrected_stock` — the number Bol.com **reports** when we read it.
 
-`pushed != bol` ise bizim dışımızda bir şey offer'a dokunmuş demektir (müşteri panelden
-elle değiştirdi, başka bir araç yazdı). Bu fark alarm üretir; tek katmanlı tasarımda
-bu durum görünmez ve fazla satış buradan çıkar.
+If `pushed != bol`, something outside this service touched the offer: the seller edited it
+by hand, or another tool wrote to it. That gap raises an alert. With a single layer the
+gap is invisible, and that is where overselling comes from.
 
-Şema: `src/db/schema.sql`
+Schema: `src/db/schema.sql`
 
 ---
 
-## 3. Kuyruk
+## 3. The queue
 
-Ayrı bir Redis/RabbitMQ kurulmuyor. Postgres tablosu + `FOR UPDATE SKIP LOCKED` yeterli;
-tek konteynerde çalışır, müşterinin VPS'ine ek bağımlılık getirmez.
+No Redis or RabbitMQ. A Postgres table plus `FOR UPDATE SKIP LOCKED` is enough. It runs in
+one container and adds no dependency to the client's VPS.
 
 ```sql
 UPDATE sync_jobs SET status = 'running', locked_by = $1, locked_at = now()
@@ -92,50 +93,50 @@ WHERE id IN (
 RETURNING *;
 ```
 
-**İş tipleri**
+**Job types**
 
-| Tip | Ne yapar | Öncelik |
+| Type | What it does | Priority |
 |---|---|---|
-| `push_offer` (stok **düşüşü**) | Bol'a PATCH | **10** |
-| `push_offer` (fiyat değişimi) | Bol'a PATCH | 50 |
-| `push_offer` (stok **artışı**) | Bol'a PATCH | 80 |
-| `resolve_offer_id` | EAN → offerId eşlemesi | 60 |
-| `pull_source` | Kaynaktan çek | 90 |
-| `reconcile` | Bol'u okuyup karşılaştır | 120 |
+| `push_offer` (stock **drop**) | PATCH to Bol.com | **10** |
+| `push_offer` (price change) | PATCH to Bol.com | 50 |
+| `push_offer` (stock **rise**) | PATCH to Bol.com | 80 |
+| `resolve_offer_id` | EAN → offerId | 60 |
+| `pull_source` | Read the source | 90 |
+| `reconcile` | Read Bol.com and compare | 120 |
 
-**Stok düşüşü her zaman öne alınır.** Fazla satışın maliyeti (iptal, satıcı puanı düşüşü)
-geç yayınlanan fiyat artışından kat kat yüksektir.
+**A stock drop always goes first.** Overselling costs a cancellation and a hit to the
+seller rating. A price rise that goes out a minute late costs nothing like that.
 
-**Tekilleştirme:** `dedupe_key = tenant_id:product_id:push_offer` üzerinde
-`status IN ('pending','running')` koşullu unique index. Bir ürün dakikada 50 kez
-değişse bile kuyrukta tek iş durur, en güncel hedefle çalışır.
+**Deduplication:** a unique index on `dedupe_key = tenant_id:product_id:push_offer`,
+conditional on `status IN ('pending','running')`. A product can change fifty times a
+minute and still have exactly one job waiting, carrying the newest target.
 
-**Toplu değil, tek tek:** v11'de toplu güncelleme ucu yok. 50/sn limiti ve %60 bütçe ile
-saatte ~108.000 offer güncellenebilir; tek tek göndermek darboğaz değil.
+**One at a time, not in bulk:** v11 has no bulk update endpoint. At 50/s with a 60%
+budget that is about 108,000 offer updates an hour. Sending them one at a time is not the
+bottleneck.
 
-### "Çalışırken değişti" yarışı — kuyruğun en sessiz hatası
+### The "changed while running" race — the queue's quietest bug
 
-Dedupe indeksi bir yan etki üretiyor: iş `running` durumdayken gelen yeni bir
-enqueue aynı satırı günceller. Yani gönderimi yapan worker elindeki eski yükle
-çalışırken satırın yükü değişmiş olur. İş bittiğinde `status='done'` yazılırsa
-**o değişiklik sessizce kaybolur** — ve kaybolan şey tipik olarak bir stok düşüşü,
-yani tam olarak fazla satışın başladığı yer.
+The dedupe index has a side effect. While a job is `running`, a new enqueue updates the
+same row. So the worker is sending an old payload while the row already holds a new one.
+If the job then finishes as `status='done'`, **that change is silently lost** — and what
+gets lost is usually a stock drop, which is exactly where overselling starts.
 
-Çözüm `markDone` içinde: `updated_at > locked_at` ise iş `done` değil `pending`
-olarak kapanıyor ve hemen yeniden çalıştırılıyor. Postgres'te `UPDATE`'in sağ
-tarafı eski değerleri gördüğü için karşılaştırma tek ifadede yapılabiliyor:
+The fix lives in `markDone`: if `updated_at > locked_at`, the job closes as `pending`
+instead of `done` and runs again at once. In Postgres the right-hand side of an `UPDATE`
+sees the old values, so the comparison fits in one statement:
 
 ```sql
 SET status = CASE WHEN updated_at > locked_at THEN 'pending' ELSE 'done' END
 ```
 
-`attempts` da bilerek **claim anında** artıyor, hata anında değil. Süreci
-çökerten bir iş böylece sonsuz döngüye girmiyor; `max_attempts`'a ulaşıp
-`dead_letters`'a düşüyor.
+`attempts` also increments **at claim time**, not on failure. A job that crashes the
+process therefore cannot loop forever. It reaches `max_attempts` and lands in
+`dead_letters`.
 
 ---
 
-## 4. Safety stock kuralı
+## 4. The safety stock rule
 
 ```
 raw        = source_state.stock
@@ -145,122 +146,132 @@ if candidate < min_publish  ->  publish = 0
 else                        ->  publish = min(candidate, max_publish, 999)
 ```
 
-Varsayılan: `buffer_abs = 2`, `buffer_pct = 0`, `min_publish = 1`, `max_publish = 999`.
+Defaults: `buffer_abs = 2`, `buffer_pct = 0`, `min_publish = 1`, `max_publish = 999`.
 
-Ek kurallar:
+On top of that:
 
-1. **Asimetrik eşik.** Stok düşerken her değişiklik anında gönderilir.
-   Stok artarken `abs(yeni - gönderilen) < stock_delta_threshold` (varsayılan 2) ise
-   gönderilmez. Böylece 7↔8 arasında salınan bir ürün günde yüzlerce yazma üretmez.
-2. **Sıfır özel durumdur.** Hedef 0 ise eşik dinlenmez, daima gönderilir.
-3. **`managedByRetailer` seçimi tenant ayarıdır.** Bol siparişleri kaynak sisteme geri
-   yazılıyorsa `true`, yazılmıyorsa `false`. Yanlış seçim doğrudan fazla satış demektir;
-   detayı `docs/bol-api-notes.md` §3'te.
-4. **Kaynak bayatsa dokunma.** `source_state.observed_at` `SOURCE_STALE_AFTER_MIN`
-   dakikadan eskiyse plan üretilmez. Çöken bir kaynağın "0 stok" cevabı tüm kataloğu
-   vitrinden düşürebilir — bu servisin yapabileceği en pahalı hata.
-5. **Toplu düşüş sigortası.** Tek turda kataloğun `BULK_DROP_GUARD_PCT` oranından
-   fazlası sıfıra düşüyorsa iş kuyruğu durdurulur ve uyarı yazılır. Neredeyse her zaman
-   kaynak tarafında bozuk bir feed anlamına gelir.
+1. **An asymmetric threshold.** Every drop is sent immediately. A rise is skipped when
+   `abs(new - pushed) < stock_delta_threshold` (default 2). A product that moves between
+   7 and 8 then does not produce hundreds of writes a day.
+2. **Zero is a special case.** When the target is 0 the threshold is ignored and the
+   value always goes out.
+3. **`managedByRetailer` is a tenant setting.** `true` when Bol.com orders are written
+   back into the source system, `false` when they are not. The wrong choice means
+   overselling, directly. The detail is in `docs/bol-api-notes.md` §3.
+4. **Do not touch a stale source.** If `source_state.observed_at` is older than
+   `SOURCE_STALE_AFTER_MIN` minutes, nothing is planned. A dead source that answers
+   "0 stock" can pull the whole catalogue off the shelf. That is the most expensive
+   mistake this service could make.
+5. **A bulk-drop guard.** If more than `BULK_DROP_GUARD_PCT` of the catalogue goes to
+   zero in one pass, the batch is held and a warning is written. That pattern nearly
+   always means a broken feed on the source side.
 
-Uygulama: `src/sync/safetyStock.js` — saf fonksiyon, yan etkisiz, doğrudan test edilebilir.
+Code: `src/sync/safetyStock.js` — pure functions, no side effects, directly testable.
 
 ---
 
-## 5. Fiyat kuralı
+## 5. The price rule
 
 ```
-base    = source_state.price            (KDV dahil, EUR)
+base    = source_state.price            (VAT included, EUR)
 marked  = base * (1 + markup_pct / 100)
 clamped = clamp(marked, floor_price, ceiling_price)
 final   = round(clamped, rounding)      none | cent | psychological_99
 ```
 
-Sigortalar:
+Guard rails:
 
-- `final < 1` veya `final > 9999` → gönderilmez, dead letter. (Bol'un spec sınırı.)
-- `abs(final - pushed_price) / pushed_price > max_change_pct` (varsayılan %25) →
-  gönderilmez, manuel onay bekler. Kaynaktaki kuruş/euro karışıklığı burada yakalanır.
-- `bundlePrices` daima `quantity: 1` elemanı içerir; kademeli fiyat varsa
-  quantity artan, unitPrice azalan sırada doğrulanır.
+- `final < 1` or `final > 9999` → not sent, dead letter. (Bol.com's own spec limits.)
+- `abs(final - pushed_price) / pushed_price > max_change_pct` (default 25%) → not sent,
+  waits for a human. This is what catches a source feed that starts reporting cents
+  instead of euros.
+- `bundlePrices` always contains a `quantity: 1` element. If there are volume tiers, the
+  quantity must increase and the unit price must decrease.
 
-Uygulama: `src/sync/pricing.js`
+Code: `src/sync/pricing.js`
 
 ---
 
-## 6. Rate limit yönetimi
+## 6. Rate limits
 
-Kova başına **token bucket**, tenant bazlı:
+A token bucket per bucket name, per tenant:
 
-| Kova | Gerçek limit | Varsayılan bütçe (%60) |
+| Bucket | Real limit | Default budget (60%) |
 |---|---|---|
-| `offers_write` | 50 / sn | 30 / sn |
-| `offers_read` | 25 / sn | 15 / sn |
-| `process_status` | 100 / sn | 60 / sn |
-| `process_status_bulk` | 2 / sn | 1 / sn |
-| `export` | 9 / saat | 5 / saat |
-| `orders_read` | 25 / dk | 15 / dk |
+| `offers_write` | 50 / s | 30 / s |
+| `offers_read` | 25 / s | 15 / s |
+| `process_status` | 100 / s | 60 / s |
+| `process_status_bulk` | 2 / s | 1 / s |
+| `export` | 9 / hour | 5 / hour |
+| `orders_read` | 25 / min | 15 / min |
 
-Kurallar:
+The rules:
 
-- Limitler **satıcı hesabı başına**dır. Müşterinin başka bir aracı varsa aynı kovadan
-  içiyoruz; bu yüzden %100 değil %60 kullanılır (`tenants.rate_budget_pct` ile ayarlanır).
-- Her cevapta `X-RateLimit-Remaining` okunur. Kalan, kendi hesabımızdan düşükse kova
-  **o değere indirilir** — yani gerçek kaynak Bol'un başlığıdır, bizim sayacımız değil.
-- 429 gelirse `Retry-After` saniyesi aynen uygulanır ve kova sıfırlanır.
-- Token yenileme ayrı ve çok daha dar bir limite tabi: token tek yerde tutulur,
-  299 saniyelik ömrün 240. saniyesinde yenilenir, eşzamanlı yenileme single-flight'tır.
+- Limits are **per seller account**. If the client runs another tool, it drinks from the
+  same bucket. That is why the default is 60% and not 100%
+  (`tenants.rate_budget_pct` changes it).
+- `X-RateLimit-Remaining` is read from every response. When Bol.com's count is lower than
+  ours, the bucket **drops to that value**. Bol.com's header is the real source of truth,
+  not our own counter.
+- On a 429, the `Retry-After` value is used exactly as given and the bucket is emptied.
+- The token endpoint has its own, much tighter limit. The token is held in one place,
+  refreshed at second 240 of its 299-second life, and concurrent refreshes share one
+  request.
 
-Uygulama: `src/core/limiter.js`, `src/bol/rateLimits.js`
+Code: `src/core/limiter.js`, `src/bol/rateLimits.js`
 
 ---
 
-## 7. Hata yönetimi
+## 7. Error handling
 
-| Durum | Sınıf | Davranış |
+| Case | Class | Behaviour |
 |---|---|---|
-| 400 | kalıcı | Dead letter + `products.sync_enabled = false`. Tekrar denenmez. |
-| 401 | token | Token bir kez yenilenir, istek bir kez tekrarlanır. İkinci 401 → tenant durur. |
-| 403 | geçici | Backoff. Üst üste 3 kez → tenant devre dışı, bildirim. |
-| 404 (offer) | veri | `offer_id` temizlenir, `resolve_offer_id` kuyruğa girer. |
-| 409 | çakışma | Offer yeniden okunur, plan yeniden hesaplanır, bir kez tekrar. |
-| 429 | limit | `Retry-After` kadar beklenir, kova sıfırlanır, iş yeniden kuyruğa. |
-| 5xx / timeout | geçici | Üstel backoff + jitter, en fazla 6 deneme. |
-| Ağ hatası | geçici | Aynı. |
+| 400 | permanent | Dead letter plus `products.sync_enabled = false`. Never retried. |
+| 401 | token | Refresh once, retry once. A second 401 pauses the tenant. |
+| 403 | transient | Backoff. Three in a row pauses the tenant and raises a notice. |
+| 404 (offer) | data | Clear `offer_id`, queue a `resolve_offer_id`. |
+| 409 | conflict | Re-read the offer, re-plan, try once more. |
+| 429 | limit | Wait out `Retry-After`, empty the bucket, requeue the job. |
+| 5xx / timeout | transient | Exponential backoff with jitter, six attempts at most. |
+| Network error | transient | The same. |
 
-Backoff: `min(2^attempt * 1000ms, 5dk)` üzerine `±%20` jitter.
-Jitter olmadan tüm işler aynı anda uyanır ve ikinci bir 429 dalgası üretir.
+Backoff: `min(2^attempt * 1000ms, 5 min)` with ±20% jitter. Without the jitter every job
+that failed in the same 429 wave wakes at the same millisecond and produces the next one.
 
-**Devre kesici (circuit breaker):** 60 saniyelik pencerede bir tenant için 10'dan fazla
-geçici hata varsa o tenant 5 dakika duraklatılır. Diğer müşteriler etkilenmez.
+**Circuit breaker:** more than 10 transient failures for one tenant inside a 60-second
+window pauses that tenant for 5 minutes. Other clients are not affected.
 
-**Dead letter her zaman bir insana görünür.** Sessizce atlanan ürün yok; `dead_letters`
-tablosu `GET /health/dead-letters` ucundan ve günlük özet e-postasından okunur.
+**A dead letter is always visible to a human.** No product is skipped quietly. The
+`dead_letters` table is served by `GET /health/dead-letters` and by a daily summary.
 
-Uygulama: `src/core/errors.js`, `src/core/retry.js`, `src/core/circuitBreaker.js`
-
----
-
-## 8. Mutabakat (reconcile)
-
-15 dakikada bir:
-
-1. `GET /retailer/offers?last-modified-date-time=<son tur>&page-size=100` + cursor döngüsü
-2. Gelen her offer için `bol_stock`, `bol_corrected_stock`, `bol_price`,
-   `bol_last_modified` yazılır
-3. `pushed_* != bol_*` olan satırlar **sapma** olarak işaretlenir ve yeniden kuyruğa girer
-4. `bol_corrected_stock = 0` ama `desired_stock > 0` olan satırlar ayrı raporlanır —
-   bunlar vitrinde görünmeyen ama bizce stokta olan ürünlerdir, doğrudan ciro kaybı
-
-CSV export (`POST /retailer/offers/export`) yalnızca **ilk içe aktarmada** kullanılır:
-saatte 9 istek sınırı onu periyodik iş için uygunsuz kılıyor.
-
-Günde bir kez `last-modified` filtresi olmadan tam tarama yapılır.
+Code: `src/core/errors.js`, `src/core/retry.js`, `src/core/circuitBreaker.js`
 
 ---
 
-## 9. Konfigürasyon
+## 8. Reconciliation
 
-Tüm ayarlar `.env` üzerinden; örnek `.env.example` dosyasında.
-Kimlik bilgileri veritabanında `BOL_CRED_ENC_KEY` ile AES-256-GCM şifreli durur,
-log'a asla düz yazılmaz (`src/bol/client.js` içindeki redaksiyon).
+Every 15 minutes:
+
+1. `GET /retailer/offers?last-modified-date-time=<last run>&page-size=100`, then the
+   cursor loop.
+2. For every offer that comes back, write `bol_stock`, `bol_corrected_stock`, `bol_price`
+   and `bol_last_modified`.
+3. Rows where `pushed_* != bol_*` are marked as **drift** and go back on the queue.
+4. Rows where `bol_corrected_stock = 0` while `desired_stock > 0` are reported
+   separately. These offers are on our books but off the shelf, which is lost revenue
+   rather than a bug.
+
+The CSV export (`POST /retailer/offers/export`) is only used for the **first import**.
+Nine requests an hour makes it unusable for routine work.
+
+Once a day the pass runs without the `last-modified` filter, over everything.
+
+---
+
+## 9. Configuration
+
+Everything comes from `.env`; see `.env.example`.
+
+Credentials are stored in the database encrypted with AES-256-GCM under
+`BOL_CRED_ENC_KEY`. They never reach a log line in plain text — see the redaction in
+`src/bol/client.js`.

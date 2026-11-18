@@ -1,37 +1,39 @@
-# Bol.com API — doğrulanmış notlar
+# Bol.com API — verified notes
 
-Kaynak: canlı OpenAPI ve dokümantasyon, çekim tarihi **18.11.2026**.
-Hiçbir satır hafızadan yazılmadı; her madde aşağıdaki URL'lerden alındı.
+Source: the live OpenAPI specs and documentation, read on **18 November 2026**.
+Nothing here was written from memory. Every line comes from one of these URLs.
 
-| Ne | URL |
+| What | URL |
 |---|---|
 | Retailer API v10 spec | `https://api.bol.com/retailer/public/apispec/Retailer%20API%20-%20v10` |
 | Offers API v11 spec | `https://api.bol.com/registry/api-definitions/offers/offers-v11.yaml` |
 | Process Status v10 spec | `https://api.bol.com/registry/api-definitions/process-status/process-status-v10.yaml` |
-| Canlı rate limit listesi (JSON) | `https://api.bol.com/retailer/public/ratelimits` |
-| Kimlik doğrulama | `https://api.bol.com/retailer/public/Retailer-API/authentication.html` |
-| Konvansiyonlar (429, başlıklar) | `https://api.bol.com/retailer/public/Retailer-API/conventions.html` |
+| Live rate limit list (JSON) | `https://api.bol.com/retailer/public/ratelimits` |
+| Authentication | `https://api.bol.com/retailer/public/Retailer-API/authentication.html` |
+| Conventions (429, headers) | `https://api.bol.com/retailer/public/Retailer-API/conventions.html` |
 
 ---
 
-## 1. Kimlik doğrulama
+## 1. Authentication
 
 - `POST https://login.bol.com/token?grant_type=client_credentials`
 - `Authorization: Basic base64(clientId:clientSecret)`
 - `Content-Type: application/x-www-form-urlencoded`, `Accept: application/json`
-- Cevap: `{ access_token, token_type: "Bearer", expires_in: 299, scope }`
-- **299 saniye.** Doküman açıkça uyarıyor: her istek için yeni token alma, IP ban sebebi.
-  → Token tek yerde tutulur, 240. saniyede yenilenir, eşzamanlı yenileme tek uçuşa (single-flight) indirilir.
+- Response: `{ access_token, token_type: "Bearer", expires_in: 299, scope }`
+- **299 seconds.** The documentation warns about this directly: asking for a new token on
+  every request overloads the auth service and gets the IP banned.
+  → The token is held in one place, refreshed at second 240, and concurrent refreshes
+  share a single request.
 
-## 2. Stok ve fiyat güncelleme — iki nesil var
+## 2. Updating stock and price — there are two generations
 
-### v11 Offers API (yeni, tercih edilen)
+### v11 Offers API (new, preferred)
 
-Sürüm `11.5.0`. **Senkron çalışır** — process status mekanizması gerekmiyor.
+Version `11.5.0`. **Synchronous** — no process-status mechanism needed.
 
-| Metot | Uç | Cevap |
+| Method | Endpoint | Response |
 |---|---|---|
-| GET | `/retailer/offers` | 200 + sayfalı liste |
+| GET | `/retailer/offers` | 200 + paged list |
 | POST | `/retailer/offers` | **201** + `offerId` |
 | GET | `/retailer/offers/{offer-id}` | 200 |
 | PATCH | `/retailer/offers/{offer-id}` | **204** |
@@ -39,169 +41,178 @@ Sürüm `11.5.0`. **Senkron çalışır** — process status mekanizması gerekm
 | GET | `/retailer/offers/{offer-id}/not-for-sale-reasons` | 200 |
 
 - Accept / Content-Type: `application/vnd.retailer.v11+json`
-- `GET /retailer/offers` filtreleri: `offer-ids`, `eans`, `reference`, `for-sale`,
+- `GET /retailer/offers` filters: `offer-ids`, `eans`, `reference`, `for-sale`,
   `last-modified-date-time` (ISO 8601 UTC), `page-size` (1–100), `cursor`.
-  → **Cursor tabanlı sayfalama.** `page.nextCursor` null olana kadar dönülür.
-- `PATCH` gövdesi kısmi: `pricing`, `stock`, `fulfilment`, `onHoldByRetailer`,
+  → **Cursor-based paging.** Keep going until `page.nextCursor` is null.
+- The spec sets no `style` or `explode` on the array filters, so the OpenAPI default
+  applies: repeated parameters (`eans=a&eans=b`), not a comma-joined list. A joined list
+  would be read as one very long EAN and find nothing, without an error.
+- The `PATCH` body is partial: `pricing`, `stock`, `fulfilment`, `onHoldByRetailer`,
   `reference`, `countryAvailabilities`, `economicOperatorId`, `unknownProductTitle`.
-  Stok ve fiyat **tek istekte** güncellenir.
-- `offerId` artık UUID.
+  Stock and price are updated in **one request**.
+- `offerId` is now a UUID.
 
-v11'in v10'a göre getirdikleri (resmî "what's new" sayfası): senkron işleme,
-sayfalı offer listesi, PATCH ile kısmi güncelleme, refurbished desteği,
-NL+BE çoklu ülke tek offer, offline sebebi için ayrı uç.
+What v11 adds over v10 (from the official "what's new" page): synchronous processing, a
+paged offer list, partial updates through PATCH, refurbished support, one offer covering
+both NL and BE, and a separate endpoint for the reason an offer is offline.
 
-### v10 Retailer API (eski, yedek adaptör)
+### v10 Retailer API (old, fallback adapter)
 
-| Metot | Uç | Cevap |
+| Method | Endpoint | Response |
 |---|---|---|
 | PUT | `/retailer/offers/{offer-id}/stock` | **202** + ProcessStatus |
 | PUT | `/retailer/offers/{offer-id}/price` | **202** + ProcessStatus |
 | PUT | `/retailer/offers/{offer-id}` | 202 + ProcessStatus |
-| POST | `/retailer/offers/export` | 202 (CSV rapor talebi) |
+| POST | `/retailer/offers/export` | 202 (requests a CSV report) |
 | GET | `/retailer/offers/export/{report-id}` | 200 CSV |
 
 - Accept / Content-Type: `application/vnd.retailer.v10+json`
-- 202 dönüyor, **iş bitmiş değil**. `processStatusId` ile
-  `GET /shared/process-status/{id}` sorgulanır.
-  Durumlar: `PENDING | SUCCESS | FAILURE | TIMEOUT`.
-- Toplu sorgu: `POST /shared/process-status`, tek istekte en fazla **1000** id.
-- İlgili event tipleri: `UPDATE_OFFER_STOCK`, `UPDATE_OFFER_PRICE`, `UPDATE_OFFER`,
-  `CREATE_OFFER`, `DELETE_OFFER`, `CREATE_OFFER_EXPORT`.
-- **Uyarı:** process status kayıtları kalıcı değil. Süre dolunca 404 döner;
-  polling durdurulmalı, yoksa sonsuz döngü olur.
+- A 202 means **the work is not done**. Use the `processStatusId` with
+  `GET /shared/process-status/{id}`.
+  Statuses: `PENDING | SUCCESS | FAILURE | TIMEOUT`.
+- Bulk lookup: `POST /shared/process-status`, at most **1000** ids per request.
+- Event types that matter here: `UPDATE_OFFER_STOCK`, `UPDATE_OFFER_PRICE`,
+  `UPDATE_OFFER`, `CREATE_OFFER`, `DELETE_OFFER`, `CREATE_OFFER_EXPORT`.
+- **Warning:** process status records are not kept forever. Once a record expires the
+  lookup returns 404. Polling has to stop there, or the worker loops forever on work that
+  finished long ago.
 
-## 3. Veri şekilleri
+## 3. Data shapes
 
 ### stock
 ```json
 { "amount": 6, "managedByRetailer": true }
 ```
-- v10'da `amount` sınırı **0–999** (spec'te `minimum: 0, maximum: 999`). v11'de üst sınır
-  belirtilmemiş; yine de 999'da kırpıyoruz.
-- `managedByRetailer` semantiği (resmî açıklama):
-  - `false` → bol, **tüm açık siparişleri** düşerek düzeltilmiş stoğu kendi hesaplar.
-  - `true` → yalnızca **son offer güncellemesinden sonraki** siparişler hesaba katılır.
-  - Kural: bol siparişleri kaynak sisteme (webshop/ERP) geri yazılıyorsa `true`,
-    yazılmıyorsa `false`. Yanlış seçim doğrudan fazla satışa (oversell) yol açar.
-- `correctedStock` yalnızca okumada gelir: açık siparişler düşüldükten sonra kalan.
-  **Satışı belirleyen bu alandır**; 0 olunca ürün vitrinden düşer.
-  Bizim gönderdiğimiz `amount` ile karıştırılmamalı.
+- On v10, `amount` is limited to **0–999** (`minimum: 0, maximum: 999` in the spec). v11
+  states no upper bound, but we still clamp at 999.
+- What `managedByRetailer` means (from the official description):
+  - `false` → Bol.com subtracts **all open orders** itself and works out the corrected
+    stock.
+  - `true` → only orders placed **after the last offer update** are counted.
+  - The rule: `true` when Bol.com orders are written back into the source system
+    (webshop or ERP), `false` when they are not. The wrong choice leads straight to
+    overselling.
+- `correctedStock` is read-only: what is left after open orders are subtracted.
+  **This is the field that decides whether the product sells.** At 0 the offer is off the
+  shelf. It must not be confused with the `amount` we send.
 
 ### pricing
 ```json
 { "bundlePrices": [ { "quantity": 1, "unitPrice": 9.99 } ] }
 ```
-- Dizide `quantity: 1` olan eleman **zorunlu**, en fazla 4 eleman.
-- `unitPrice`: KDV **dahil**, `minimum: 1`, `maximum: 9999`, iki ondalık, nokta ayraçlı.
-- Birden fazla kademe varsa `quantity` artan, `unitPrice` azalan sırada olmalı.
+- An element with `quantity: 1` is **mandatory**. At most 4 elements.
+- `unitPrice`: VAT **included**, `minimum: 1`, `maximum: 9999`, two decimals, dot
+  separator.
+- With more than one tier, `quantity` must increase and `unitPrice` must decrease.
 
-## 4. Rate limit — canlı listeden alınan gerçek değerler
+## 4. Rate limits — real values from the live list
 
-| Uç | Metot | Limit |
+| Endpoint | Method | Limit |
 |---|---|---|
-| `/retailer/offers/**` | GET, POST, PATCH, DELETE | **50 / saniye** |
-| `/retailer/offers*` | GET (liste) | **25 / saniye** |
-| `/retailer/offers/*/stock` | PUT (v10) | 50 / saniye |
-| `/retailer/offers/*/price` | PUT (v10) | 50 / saniye |
-| `/retailer/offers/export` | POST | **9 / saat** |
-| `/retailer/offers/export/*` | GET | 9 / saat |
-| `/shared/process-status/*` | GET | 100 / saniye |
-| `/shared/process-status` | GET, POST (toplu) | **2 / saniye** |
-| `/retailer/orders` | GET | 25 / dakika |
-| `/retailer/orders/*` | GET | 25 / saniye |
-| `/retailer/inventory` | GET | 20 / dakika |
+| `/retailer/offers/**` | GET, POST, PATCH, DELETE | **50 / second** |
+| `/retailer/offers*` | GET (list) | **25 / second** |
+| `/retailer/offers/*/stock` | PUT (v10) | 50 / second |
+| `/retailer/offers/*/price` | PUT (v10) | 50 / second |
+| `/retailer/offers/export` | POST | **9 / hour** |
+| `/retailer/offers/export/*` | GET | 9 / hour |
+| `/shared/process-status/*` | GET | 100 / second |
+| `/shared/process-status` | GET, POST (bulk) | **2 / second** |
+| `/retailer/orders` | GET | 25 / minute |
+| `/retailer/orders/*` | GET | 25 / second |
+| `/retailer/inventory` | GET | 20 / minute |
 
-Başlıklar (konvansiyon sayfası):
-- Limit aşılmadıysa: `X-RateLimit-Limit`, `X-RateLimit-Remaining`, `X-RateLimit-Reset`
-- Aşıldıysa: **429** + `Retry-After: <saniye>` ve gövdede
+Headers (from the conventions page):
+- Within the limit: `X-RateLimit-Limit`, `X-RateLimit-Remaining`, `X-RateLimit-Reset`
+- Over it: **429** plus `Retry-After: <seconds>`, with a body of
   `{ "title": "Too Many Requests", "status": 429, "detail": "..." }`
 
-Tasarım sonuçları:
-1. CSV export **saatte 9** — ilk içe aktarma dışında kullanılmaz.
-   Mutabakat (reconcile) için v11 `GET /retailer/offers` + `last-modified-date-time` kullanılır.
-2. Limitler **satıcı hesabı başına**dır, uygulama başına değil. Müşterinin başka bir aracı
-   (repricer, ERP) varsa aynı kovayı paylaşıyoruz. Varsayılan bütçe: limitin **%60**'ı.
-3. 403 bile "retryable" olarak işaretli (konvansiyon tablosu), 400 değil.
+What follows for the design:
 
-## 5. Hata kodları (resmî tabloya göre)
+1. The CSV export allows **9 requests an hour**, so it is only usable for the first
+   import. Reconciliation uses the v11 `GET /retailer/offers` with
+   `last-modified-date-time` instead.
+2. Limits are **per seller account**, not per application. If the client runs a repricer
+   or an ERP, we share the same bucket with it. Default budget: **60%** of the limit.
+3. Even a 403 is marked retryable in the conventions table. A 400 is not.
 
-| Kod | Yeniden denenir mi | Bizim davranışımız |
+## 5. Error codes (per the official table)
+
+| Code | Retryable | What we do |
 |---|---|---|
-| 400 | Hayır | Kalıcı hata → dead letter, SKU işaretlenir |
-| 401 | Hayır | Token bir kez yenilenir, istek bir kez tekrarlanır |
-| 403 | **Evet** | Backoff ile tekrar; 3 kez üst üste ise tenant devre dışı |
-| 404 | Hayır | Offer silinmiş → `offer_id` temizlenir, EAN'den yeniden çözülür |
-| 409 | — | Offer yeniden okunur, plan yeniden hesaplanır, bir kez tekrar |
-| 429 | Evet | `Retry-After` aynen uygulanır, kova boşaltılır |
-| 5xx | Evet | Üstel backoff + jitter, en fazla 6 deneme |
+| 400 | No | Permanent → dead letter, the SKU is flagged |
+| 401 | No | Refresh the token once, retry the request once |
+| 403 | **Yes** | Back off and retry; three in a row pauses the tenant |
+| 404 | No | The offer is gone → clear `offer_id`, resolve it again from the EAN |
+| 409 | — | Re-read the offer, re-plan, try once more |
+| 429 | Yes | Apply `Retry-After` exactly, empty the bucket |
+| 5xx | Yes | Exponential backoff with jitter, six attempts at most |
 
 ---
 
-## 6. Demo ortamı — var, ama sandığın gibi değil
+## 6. The demo environment — it exists, but not in the way you would hope
 
-18.11.2026'da doğrulandı. İki bağımsız kanıt:
+Verified on 18 November 2026, two ways.
 
-**Yol testi.** Uydurma ön ekler `403` döndürüyor, demo ön ekleri `401` (kimlik doğrulama
-istiyor) — yani yollar gerçek ve yönlendirilmiş durumda.
+**Path probe.** Made-up prefixes return `403`. The demo prefixes return `401`, meaning
+"authenticate first" — so those paths are real and routed.
 
 ```
 401  https://api.bol.com/retailer-demo/offers
 401  https://api.bol.com/shared-demo/process-status/1
-403  https://api.bol.com/retailer-xyzzy/offers      <- uydurma
-403  https://api.bol.com/nonsense/offers            <- uydurma
+403  https://api.bol.com/retailer-xyzzy/offers      <- made up
+403  https://api.bol.com/nonsense/offers            <- made up
 ```
 
-**Resmî spec.** v10 spec'inin kendi `info.description` alanı demo ortamını adıyla
-anlatıyor ve iki doküman veriyor:
+**The spec itself.** The v10 spec's own `info.description` names the demo environment and
+links two pages:
 - [Demo environment](https://api.bol.com/retailer/public/Retailer-API/demo/demo.html)
 - [Demo scenarios v10](https://api.bol.com/retailer/public/Retailer-API/demo/v10-index.html)
-  — 16 uç grubu listeli: Commissions, Insights, Inventory, Invoices, Offers, Orders,
+  — 16 endpoint groups: Commissions, Insights, Inventory, Invoices, Offers, Orders,
   Process Status, Products, Promotions, Replenishments, Retailers, Returns, Shipments,
   Shipping Labels, Subscriptions, Transports.
 
-### Ne veriyor
+### What it gives you
 
-| Özellik | Durum |
+| Feature | State |
 |---|---|
-| Kimlik doğrulama | Üretimdekiyle **aynı** çalışıyor |
-| Her uç için örnek cevap | Var, **sabit kodlanmış** |
-| Doğrulama ve modeller | Üretimin **güncel** sürümüyle aynı |
-| Rate limit başlıkları | Var |
+| Authentication | Works **exactly** as in production |
+| An example response per endpoint | Yes, **hard coded** |
+| Validation and models | The **current** production versions |
+| Rate limit headers | Yes |
 
-### Ne vermiyor — üç sert sınır
+### What it does not — three hard limits
 
-1. **Durum tutmuyor.** Bol'un kendi cümlesi: *"updates will return a process status
+1. **It keeps no state.** Bol.com's own words: *"updates will return a process status
    entity, but this is a mocked instance so no actual updates are being processed."*
-   Yazdığın stok hiçbir yere yazılmıyor, geri okuduğunda değişmemiş oluyor.
-   Sabit kodlanmış cevaplar yalnızca **dokümanda tarif edilen belirli isteklere**
-   dönüyor; uçtan uca bir akış yok.
-2. **Tek bir genel rate limit** var, uç başına değil. Yani §4'teki limit tablosunu
-   demo ortamda test edemezsin.
-3. **CI/CD'ye bağlanması önerilmiyor**, performans testine de uygun değil.
+   The stock you write goes nowhere. Read it back and nothing has changed. The hard-coded
+   answers only match **the specific requests described in the demo documentation**;
+   there is no end-to-end flow.
+2. **One generic rate limit**, not one per endpoint. So the limit table in §4 cannot be
+   tested there.
+3. **Not recommended for CI/CD**, and not suitable for load testing.
 
-### Kimlik bilgisi nereden geliyor — asıl kısıt bu
+### Where the credentials come from — this is the real constraint
 
-Demo ortamı da dahil her şey **Seller Dashboard (SDD)** üzerinden alınan Client ID +
-Client Secret istiyor. Self-servis geliştirici anahtarı **yok**. Yani bol.com satıcı
-hesabı olmadan demo ortamına bile giremiyorsun.
+Everything, the demo environment included, needs a Client ID and Client Secret from the
+**Seller Dashboard (SDD)**. There is **no** self-service developer key. Without a bol.com
+seller account you cannot even reach the demo environment.
 
-Yol: `SDD → hesap profili → Instellingen → Diensten → API Instellingen`.
-Önce **teknik iletişim bilgisi** zorunlu — doldurulmazsa API erişimi verilmiyor, ve
-Bol ulaşamazsa API yasağı uygulanabiliyor.
+The path: `SDD → account profile → Instellingen → Diensten → API Instellingen`.
+A **technical contact** is required first. Without it, API access is not granted, and if
+Bol.com cannot reach that contact they may ban the integration.
 
-Panelde iki bölüm var:
+The dashboard has two sections:
 
-| Bölüm | Ne işe yarıyor |
+| Section | What it is for |
 |---|---|
-| **Client Credentials** | Satıcının kendi oluşturduğu anahtarlar |
-| **Authorized parties** | Entegrasyon partnerlerine verilen anahtarlar |
+| **Client Credentials** | Keys the seller created themselves |
+| **Authorized parties** | Keys given to integration partners |
 
-**Pratik sonuç — entegrasyonun tasarımı buna göre.** Servisin kendi satıcı hesabı
-olmasına gerek yok: mağaza sahibi kendi panelinde **servise özel bir anahtar çifti**
-oluşturup veriyor. Bol'un kendi tavsiyesi de bu — *"Create separate credentials for
-separate purposes. Do not reuse the same credentials for your own app(s) to grant
-access to anyone else."* Erişim çöp kutusu simgesine basarak tek tıkla geri alınıyor.
+**What this means for the design.** The service does not need a seller account of its
+own. The shop owner creates **a key pair just for the service** in their own dashboard.
+Bol.com recommends exactly that — *"Create separate credentials for separate purposes. Do
+not reuse the same credentials for your own app(s) to grant access to anyone else."*
+Access is revoked with one click on the bin icon.
 
-Yani servis hiçbir zaman mağazanın şifresini görmüyor ve verilen erişim her an
-iptal edilebiliyor. Bu, entegrasyonun güvenlik modelinin tamamı.
+So the service never sees the shop's password, and the access it was given can be taken
+back at any moment. That is the whole security model of the integration.
